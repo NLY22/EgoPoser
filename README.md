@@ -27,6 +27,7 @@ Contents
 ----------
 
 * [Installation](#installation)
+* [Vision Pro Realtime Pipeline](#vision-pro-realtime-pipeline)
 * [Datasets](#datasets)
 * [Training](#training)
 * [Testing](#testing)
@@ -53,6 +54,67 @@ or through pip:
 pip install -r requirements.txt
 ```
 We test our code on Python 3.10.0.
+
+Vision Pro Realtime Pipeline
+----------
+
+The realtime scripts use the WebSocket/JSON contract implemented by
+[`NLY22/EGO_UNITY`](https://github.com/NLY22/EGO_UNITY). Before starting,
+place the original SMPL-H/DMPL assets under `support_data/body_models` and
+the pretrained checkpoint at `model_zoo/egoposer.pth`.
+
+Run a pure NumPy coordinate/feature test:
+
+```bash
+python vision_pro_receiver.py --self-test
+```
+
+Run live inference and record both tracker poses and encoded 54D features:
+
+```bash
+python egoposer_server.py \
+  --device auto \
+  --record support_data/github_data/live_session.npz
+```
+
+The NPZ keeps frame-aligned tracker poses, SMPL-space poses, `sparse_input`
+(`[N, 54]`), hand visibility, inference time, and the returned
+`joints_unity` (`[N, 22, 3]`). Use `has_prediction` to exclude warm-up or
+failed inference frames.
+
+Set Unity's `Application.persistentDataPath/EgoPoserConfig/server.json` to:
+
+```json
+{
+  "server_url": "ws://<computer-lan-ip>:8888/ws"
+}
+```
+
+The model warms up for 80 encoded frames. The server then returns 22 SMPL
+joints in Unity world-space metres. Only one of the following servers may use
+port 8888 at a time.
+
+To validate the Unity network and skeleton without Vision Pro model inputs,
+play the bundled AMASS sample:
+
+```bash
+python unity_bridge.py --mode raw
+```
+
+To validate the pretrained network on correctly encoded AMASS data:
+
+```bash
+python unity_bridge.py --mode model
+```
+
+To record Unity tracker messages without loading PyTorch or SMPL-H, run:
+
+```bash
+python vision_pro_receiver.py --port 8889 \
+  --output support_data/github_data/visionpro_track.npz
+```
+
+For that recorder-only mode, temporarily change Unity's URL to port `8889`.
 
 Datasets
 ----------
