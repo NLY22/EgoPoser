@@ -44,19 +44,26 @@ class AvatarNet(nn.Module):
 
     def input_masking(self, input_tensor, fov_l, fov_r):
 
-        lefthand_idx = [*range(6,12),*range(24,30),*range(39,42),*range(48,51)]
-        righthand_idx = [*range(12,18),*range(30,36),*range(42,45),*range(51,54)]
+        # The forward pass appends six temporal-position features:
+        # head [54:56], left hand [56:58], right hand [58:60].
+        # Mask the appended hand features as well, otherwise an untracked hand
+        # still leaks its horizontal displacement into the transformer.
+        lefthand_idx = [*range(6,12),*range(24,30),*range(39,42),*range(48,51),*range(56,58)]
+        righthand_idx = [*range(12,18),*range(30,36),*range(42,45),*range(51,54),*range(58,60)]
 
-        lefthand_out_fov_selector=torch.zeros(input_tensor.shape, dtype=torch.bool) 
+        fov_l = fov_l.to(device=input_tensor.device, dtype=torch.bool)
+        fov_r = fov_r.to(device=input_tensor.device, dtype=torch.bool)
+
+        lefthand_out_fov_selector=torch.zeros(input_tensor.shape, dtype=torch.bool, device=input_tensor.device)
         lefthand_out_fov_selector[fov_l==False]=True
-        no_lefthand_selector=torch.ones(input_tensor.shape[2], dtype=torch.bool)
+        no_lefthand_selector=torch.ones(input_tensor.shape[2], dtype=torch.bool, device=input_tensor.device)
         no_lefthand_selector[lefthand_idx]=False
         lefthand_out_fov_selector[...,no_lefthand_selector] = False
         input_tensor[lefthand_out_fov_selector]=0
 
-        righthand_out_fov_selector=torch.zeros(input_tensor.shape, dtype=torch.bool) 
+        righthand_out_fov_selector=torch.zeros(input_tensor.shape, dtype=torch.bool, device=input_tensor.device)
         righthand_out_fov_selector[fov_r==False]=True
-        no_righthand_selector=torch.ones(input_tensor.shape[2], dtype=torch.bool)
+        no_righthand_selector=torch.ones(input_tensor.shape[2], dtype=torch.bool, device=input_tensor.device)
         no_righthand_selector[righthand_idx]=False
         righthand_out_fov_selector[...,no_righthand_selector] = False
         input_tensor[righthand_out_fov_selector]=0

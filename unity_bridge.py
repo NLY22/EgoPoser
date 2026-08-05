@@ -1,257 +1,347 @@
 """
-EgoPoser → Unity 桥接 (FK位置驱动)
-发送22个关节位置, Unity做可视化验证
+AMASS playback bridge for the EGO_UNITY WebSocket client.
+
+This is an offline diagnostic tool, not the live Vision Pro inference server.
+It accepts the same ``trackers`` JSON as ``egoposer_server.py`` and uses each
+incoming frame as a clock tick.  It returns either:
+
+* ``raw``: ground-truth AMASS/SMPL-H joints; or
+* ``model``: pretrained EgoPoser predictions from correctly encoded AMASS data.
+
+The returned body is translated so joint 15 (head) matches Unity's current
+head position.  This isolates Unity rendering/protocol problems from live
+tracker-domain problems.
 """
-import os, sys, time, struct, socket
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 import torch
-from collections import deque
+
 
 EGOPOSER_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, EGOPOSER_DIR)
+if EGOPOSER_DIR not in sys.path:
+    sys.path.insert(0, EGOPOSER_DIR)
 
-from utils import utils_option as option
-from models.select_model import define_Model, define_bm
-from utils import utils_transform
 from human_body_prior.tools.rotation_tools import aa2matrot, local2global_pose
-
-# ===== 网络配置 =====
-# 本地测试: HOST = '127.0.0.1'
-# 局域网/Vision Pro: HOST = '0.0.0.0' (监听所有网卡)
-HOST = '0.0.0.0'
-PORT = 8888
-YAML_PATH = os.path.join(EGOPOSER_DIR, 'options/test_egoposer.yaml')
-# 选择测试数据文件
-DATA_FILE = 'support_data/github_data/dmpl_sample.npz'    # DMPL 样本 (有动作)
-# DATA_FILE = 'support_data/github_data/amass_sample.npz'   # AMASS 样本 (走路)
-WINDOW_SIZE = 80
-
-# ===== 模式开关 =====
-# True  = 直接输出 AMASS 原始动作 (ground truth)，不经过 EgoPoser 推理
-# False = EgoPoser 模型推理 (默认)
-RAW_MODE = False
+from egoposer_server import (
+    DEFAULT_YAML,
+    EgoPoserModelRunner,
+    ModelPrediction,
+    load_model,
+)
+from utils import utils_transform
+from vision_pro_receiver import (
+    EgoPoserFeatureEncoder,
+    TrackerFrameError,
+    matrix_to_quaternion_xyzw,
+    smpl_to_unity_positions,
+    smpl_to_unity_rotation,
+)
 
 
-def load_model(yaml_path=YAML_PATH):
-    opt = option.parse(yaml_path, is_train=True)
-    opt['path']['pretrained'] = opt['pretrained_model']
-    opt = option.dict_to_nonedict(opt)
-    model = define_Model(opt)
-    model.load(test=True)
-    model.net.eval()
-    return model
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8888
+DEFAULT_DATA = os.path.join(
+    EGOPOSER_DIR,
+    "support_data",
+    "github_data",
+    "dmpl_sample.npz",
+)
+TRACKER_JOINTS = (15, 20, 21)
 
 
-def load_amass_sample():
-    data = np.load(DATA_FILE, allow_pickle=True)
-    poses = torch.tensor(data['poses'])
-    trans = torch.tensor(data['trans'])
-    return poses, trans
+@dataclass(frozen=True)
+class AmassSequence:
+    sparse_input: np.ndarray
+    head_positions_smpl: np.ndarray
+    joints_smpl: np.ndarray
+    root_rotations_smpl: np.ndarray
+
+    @property
+    def length(self) -> int:
+        return int(self.sparse_input.shape[0])
 
 
-def process_amass_to_input(poses, trans, bm, device):
-    poses = poses.to(device).float()
-    trans = trans.to(device).float()
-    n_frames = min(600, poses.shape[0])
-    poses = poses[:n_frames]
-    trans = trans[:n_frames]
+def load_amass_sequence(
+    data_path: str,
+    body_model: Any,
+    device: torch.device,
+    max_frames: int,
+) -> AmassSequence:
+    """Prepare AMASS with the same frame alignment and features as prepare_data.py."""
 
-    pose_aa = poses[:, :66].reshape(-1, 3)
-    pose_6d = utils_transform.aa2sixd(pose_aa).reshape(n_frames, -1)
-    pose_matrot = aa2matrot(poses.reshape(-1, 3)).reshape(n_frames, -1, 9)
-    rot_global = local2global_pose(pose_matrot, bm.kintree_table[0].long())
+    data_path = os.path.abspath(data_path)
+    if not os.path.isfile(data_path):
+        raise FileNotFoundError(f"AMASS sample does not exist: {data_path}")
 
-    head_rot = rot_global[:, [15], :, :]
-    lhand_rot = rot_global[:, [20], :, :]
-    rhand_rot = rot_global[:, [21], :, :]
+    data = np.load(data_path, allow_pickle=True)
+    if "poses" not in data or "trans" not in data:
+        raise ValueError("AMASS NPZ must contain 'poses' and 'trans'")
 
-    head_6d = utils_transform.matrot2sixd(head_rot.reshape(-1, 3, 3)).reshape(n_frames, 6)
-    lhand_6d = utils_transform.matrot2sixd(lhand_rot.reshape(-1, 3, 3)).reshape(n_frames, 6)
-    rhand_6d = utils_transform.matrot2sixd(rhand_rot.reshape(-1, 3, 3)).reshape(n_frames, 6)
+    source_fps = float(data["mocap_framerate"]) if "mocap_framerate" in data else 60.0
+    stride = max(1, int(round(source_fps / 60.0)))
+    poses_numpy = np.asarray(data["poses"])[::stride]
+    trans_numpy = np.asarray(data["trans"])[::stride]
+    frame_count = min(int(max_frames), poses_numpy.shape[0], trans_numpy.shape[0])
+    if frame_count < 2:
+        raise ValueError("AMASS sequence must contain at least two 60 Hz frames")
 
-    body = bm(**{'pose_body': poses[:, 3:66], 'root_orient': poses[:, :3], 'trans': trans})
-    jpos = body.Jtr[:, :22, :]
-    head_pos = jpos[:, 15, :]
-    lhand_pos = jpos[:, 20, :]
-    rhand_pos = jpos[:, 21, :]
+    poses = torch.as_tensor(
+        poses_numpy[:frame_count],
+        dtype=torch.float32,
+        device=device,
+    )
+    trans = torch.as_tensor(
+        trans_numpy[:frame_count],
+        dtype=torch.float32,
+        device=device,
+    )
 
-    head_vel = torch.cat([torch.zeros(1, 6, device=device), head_6d[1:] - head_6d[:-1]], dim=0)
-    lhand_vel = torch.cat([torch.zeros(1, 6, device=device), lhand_6d[1:] - lhand_6d[:-1]], dim=0)
-    rhand_vel = torch.cat([torch.zeros(1, 6, device=device), rhand_6d[1:] - rhand_6d[:-1]], dim=0)
+    with torch.inference_mode():
+        local_rotations = aa2matrot(poses.reshape(-1, 3)).reshape(frame_count, -1, 9)
+        global_rotations = local2global_pose(
+            local_rotations,
+            body_model.kintree_table[0].long(),
+        )
+        body = body_model(
+            pose_body=poses[:, 3:66],
+            root_orient=poses[:, :3],
+            trans=trans,
+        )
+        joints_smpl = body.Jtr[:, :22].detach().cpu().numpy()
 
-    zero3 = torch.zeros(n_frames, 3, device=device)
-    return torch.cat([
-        head_6d, lhand_6d, rhand_6d,
-        head_vel, lhand_vel, rhand_vel,
-        head_pos, lhand_pos, rhand_pos,
-        zero3, zero3, zero3,
-    ], dim=-1).float()
+    tracker_rotations = (
+        global_rotations[:, TRACKER_JOINTS].detach().cpu().numpy()
+    )
+    tracker_positions = joints_smpl[:, TRACKER_JOINTS]
 
+    # Seed frame 0 as history, then encode frames 1..N-1.  This exactly matches
+    # prepare_data.py, which drops the first pose after computing velocities.
+    encoder = EgoPoserFeatureEncoder()
+    encoder.encode_smpl(tracker_rotations[0], tracker_positions[0])
+    sparse_frames = [
+        encoder.encode_smpl(tracker_rotations[index], tracker_positions[index])
+        for index in range(1, frame_count)
+    ]
+    sparse_input = np.stack(sparse_frames).astype(np.float32)
 
-def main():
-    print("=" * 50)
-    print("  EgoPoser → Unity (FK位置驱动)")
-    print("=" * 50)
+    # Independent vectorized equality check against the original implementation.
+    rotations_current = global_rotations[1:, TRACKER_JOINTS]
+    rotations_relative = torch.matmul(
+        torch.inverse(global_rotations[:-1]),
+        global_rotations[1:],
+    )[:, TRACKER_JOINTS]
+    current_6d = utils_transform.matrot2sixd(
+        rotations_current.reshape(-1, 3, 3)
+    ).reshape(frame_count - 1, -1)
+    relative_6d = utils_transform.matrot2sixd(
+        rotations_relative.reshape(-1, 3, 3)
+    ).reshape(frame_count - 1, -1)
+    positions_current = torch.as_tensor(
+        tracker_positions[1:].reshape(frame_count - 1, -1),
+        device=device,
+    )
+    positions_velocity = torch.as_tensor(
+        (tracker_positions[1:] - tracker_positions[:-1]).reshape(frame_count - 1, -1),
+        device=device,
+    )
+    original_features = torch.cat(
+        (current_6d, relative_6d, positions_current, positions_velocity),
+        dim=-1,
+    ).detach().cpu().numpy()
+    np.testing.assert_allclose(sparse_input, original_features, atol=1e-5, rtol=1e-5)
 
-    model = load_model(YAML_PATH)
-    opt = option.parse(YAML_PATH, is_train=True)
-    opt = option.dict_to_nonedict(opt)
-    bm_dict = define_bm(opt)
-    bm = bm_dict['male']
-
-    poses, trans = load_amass_sample()
-    input_data = process_amass_to_input(poses, trans, bm, model.device)
-    print(f"[AMASS] 输入: {input_data.shape}")
-
-    # 提取原始 AMASS 关节位置 (GT, 用于 RAW_MODE)
-    poses_gpu = poses.to(model.device).float()
-    trans_gpu = trans.to(model.device).float()
-    n_frames = min(600, poses_gpu.shape[0])
-    body_gt = bm(**{'pose_body': poses_gpu[:n_frames, 3:66],
-                    'root_orient': poses_gpu[:n_frames, :3],
-                    'trans': trans_gpu[:n_frames]})
-    gt_joints = body_gt.Jtr[:, :22, :].cpu().numpy()  # [N, 22, 3], SMPL 空间
-
-    # 坐标转换辅助函数
-    def smpl_to_unity(jpos):
-        jp = np.zeros_like(jpos)
-        jp[:, 0] = jpos[:, 0]
-        jp[:, 1] = jpos[:, 2]
-        jp[:, 2] = -jpos[:, 1]
-        jp[:, 0] += 0.2
-        jp[:, 1] -= 0.1
-        return jp
-
-    mode_name = "RAW (原始AMASS动作)" if RAW_MODE else "EgoPoser 推理"
-    print(f"[模式] {mode_name}")
-
-    if not RAW_MODE:
-        infer = EgoPoserInference(model)
-        infer.prefill(input_data[0].cpu().numpy())
-    # 提取输入数据中的头部位置 (54维输入的索引36:39)
-    input_head_pos = input_data[:, 36:39].cpu().numpy()  # [600, 3], SMPL空间
-
-    server = socket.socket()
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(1)
-    print(f"[网络] 等待 Unity 连接 {HOST}:{PORT} ...")
-    conn, addr = server.accept()
-    print(f"[网络] ✅ Unity 已连接: {addr}")
-
-    frame_idx = 0
-    frame_count = 0
-    t_start = time.time()
-
-    try:
-        while True:
-            if frame_idx >= len(input_data):
-                frame_idx = 0
-
-            if RAW_MODE:
-                # 直接输出原始 AMASS 关节位置
-                joint_pos = smpl_to_unity(gt_joints[frame_idx])
-                frame_idx += 1
-            else:
-                # EgoPoser 推理
-                sparse_frame = input_data[frame_idx].cpu().numpy()
-                frame_idx += 1
-                result = infer.step_pos(sparse_frame, input_head_pos[frame_idx - 1])
-                if result is None:
-                    time.sleep(1.0 / 60)
-                    continue
-                joint_pos = result
-
-            # 发送 22个关节位置 (264字节)
-            data = joint_pos.astype(np.float32).tobytes()
-            conn.sendall(struct.pack('I', len(data)) + data)
-
-            frame_count += 1
-            if frame_count == 1:
-                print(f"[调试] 第1帧 Pelvis: {joint_pos[0]}")
-                print(f"[调试] 第1帧 Head:   {joint_pos[15]}")
-
-            if frame_count % 100 == 0:
-                print(f"[发送] {frame_count} 帧")
-
-            sleep_time = 1.0/60 - (time.time() - t_start)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            t_start = time.time()
-
-    except (BrokenPipeError, ConnectionResetError) as e:
-        print(f"[网络] ❌ {e}")
-    except KeyboardInterrupt:
-        print("\n[系统] 用户中断")
-    finally:
-        conn.close(); server.close()
-        print(f"[系统] 共发送 {frame_count} 帧")
+    return AmassSequence(
+        sparse_input=sparse_input,
+        head_positions_smpl=tracker_positions[1:, 0].astype(np.float32),
+        joints_smpl=joints_smpl[1:].astype(np.float32),
+        root_rotations_smpl=global_rotations[1:, 0].detach().cpu().numpy().astype(np.float32),
+    )
 
 
-class EgoPoserInference:
-    def __init__(self, model):
+def _unity_head_position(message: dict[str, Any]) -> np.ndarray:
+    head = message.get("head")
+    if not isinstance(head, dict) or not bool(head.get("tracked", False)):
+        raise TrackerFrameError("head.tracked is false")
+    position = np.asarray(head.get("position"), dtype=np.float32)
+    if position.shape != (3,) or not np.all(np.isfinite(position)):
+        raise TrackerFrameError("head.position must contain three finite values")
+    return position
+
+
+def build_playback_message(
+    prediction: ModelPrediction,
+    unity_head_position: np.ndarray,
+    sequence: int,
+    inference_ms: float,
+) -> dict[str, Any]:
+    joints_unity = smpl_to_unity_positions(prediction.joints_smpl)
+    joints_unity += unity_head_position.reshape(1, 3) - joints_unity[15]
+    root_rotation_unity = smpl_to_unity_rotation(prediction.root_rotation_smpl)
+    root_quaternion = matrix_to_quaternion_xyzw(root_rotation_unity)
+    return {
+        "type": "body_pose",
+        "sequence": int(sequence),
+        "inference_ms": round(float(inference_ms), 2),
+        "root_position": joints_unity[0].tolist(),
+        "root_rotation": root_quaternion.tolist(),
+        "joints_world": joints_unity.tolist(),
+    }
+
+
+class AmassPlaybackServer:
+    def __init__(
+        self,
+        model: Any,
+        sequence: AmassSequence,
+        mode: str,
+        host: str,
+        port: int,
+        window_size: int,
+    ) -> None:
         self.model = model
-        self.device = model.device
-        self.window_size = WINDOW_SIZE
-        self.sparse_buffer = deque(maxlen=WINDOW_SIZE)
-        self.fov_l_buffer = deque(maxlen=WINDOW_SIZE)
-        self.fov_r_buffer = deque(maxlen=WINDOW_SIZE)
+        self.sequence = sequence
+        self.mode = mode
+        self.host = host
+        self.port = int(port)
+        self.window_size = int(window_size)
+        self.active_connection = False
 
-    def prefill(self, frame):
-        for _ in range(WINDOW_SIZE):
-            self.sparse_buffer.append(frame.copy())
-            self.fov_l_buffer.append(True)
-            self.fov_r_buffer.append(True)
+    async def handle_connection(self, websocket: Any) -> None:
+        if self.active_connection:
+            await websocket.close(code=1013, reason="Only one Unity client is supported")
+            return
+        self.active_connection = True
+        peer = getattr(websocket, "remote_address", "?")
+        runner = EgoPoserModelRunner(self.model, self.window_size)
+        frame_index = 0
+        print(f"[bridge] Unity connected: {peer}")
 
-    def step_pos(self, sparse_frame, input_head_pos=None, fov_l=True, fov_r=True):
-        self.sparse_buffer.append(sparse_frame)
-        self.fov_l_buffer.append(fov_l)
-        self.fov_r_buffer.append(fov_r)
-        if len(self.sparse_buffer) < self.window_size:
-            return None
+        try:
+            async for payload in websocket:
+                try:
+                    message = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("type") != "trackers":
+                    continue
 
-        sparse = torch.FloatTensor(np.array(self.sparse_buffer)).unsqueeze(0).to(self.device)
-        fov_l_t = torch.BoolTensor(np.array(self.fov_l_buffer)).unsqueeze(0)
-        fov_r_t = torch.BoolTensor(np.array(self.fov_r_buffer)).unsqueeze(0)
+                try:
+                    head_unity = _unity_head_position(message)
+                except TrackerFrameError:
+                    continue
 
-        x = {'sparse_input': sparse, 'fov_l': fov_l_t, 'fov_r': fov_r_t}
-        with torch.no_grad():
-            output = self.model.net(x)
+                sequence_number = int(message.get("sequence", -1))
+                source_index = frame_index % self.sequence.length
+                if source_index == 0 and frame_index > 0:
+                    runner.reset()
 
-            root_orient_6d = output['root_orient']  # [1, 6]
-            pose_body_6d = output['pose_body']      # [1, 126]
+                started = time.perf_counter()
+                if self.mode == "raw":
+                    prediction = ModelPrediction(
+                        joints_smpl=self.sequence.joints_smpl[source_index],
+                        root_rotation_smpl=self.sequence.root_rotations_smpl[source_index],
+                    )
+                else:
+                    prediction = runner.step(
+                        self.sequence.sparse_input[source_index],
+                        self.sequence.head_positions_smpl[source_index],
+                        True,
+                        True,
+                    )
+                inference_ms = (time.perf_counter() - started) * 1000.0
+                frame_index += 1
 
-            # 6D → 轴角 (与原项目 test() 一致)
-            root_orient_aa = utils_transform.sixd2aa(root_orient_6d.reshape(-1,6)).reshape(-1,3).float()
-            pose_body_aa = utils_transform.sixd2aa(pose_body_6d.reshape(-1,6)).reshape(-1,63).float()
+                if prediction is None:
+                    response = {
+                        "type": "warming_up",
+                        "sequence": sequence_number,
+                        "frames_collected": runner.frames_collected,
+                        "frames_needed": runner.window_size,
+                    }
+                else:
+                    response = build_playback_message(
+                        prediction,
+                        unity_head_position=head_unity,
+                        sequence=sequence_number,
+                        inference_ms=inference_ms,
+                    )
+                await websocket.send(json.dumps(response, separators=(",", ":")))
+        except Exception as error:
+            print(f"[bridge] connection ended: {error}")
+        finally:
+            self.active_connection = False
+            print(f"[bridge] Unity disconnected: {peer}")
 
-            # 1. 无位移身体, 获取头部相对于骨盆的位置
-            body_local = self.model.bm(**{'pose_body': pose_body_aa, 'root_orient': root_orient_aa})
-            t_head2root = body_local.Jtr[0, 15].cpu().numpy()
+    async def run(self) -> None:
+        import websockets
 
-            # 2. 计算骨盆位移
-            if input_head_pos is not None:
-                t_root2world = -t_head2root + input_head_pos
-            else:
-                t_root2world = np.zeros(3)
-
-            # 3. 带位移的完整身体
-            t_tensor = torch.tensor(t_root2world, dtype=torch.float32, device=self.device).unsqueeze(0)
-            body_pose = self.model.bm(**{
-                'pose_body': pose_body_aa, 'root_orient': root_orient_aa,
-                'trans': t_tensor, 'betas': output.get('betas', None)
-            })
-            joint_pos = body_pose.Jtr[0, :22].cpu().numpy()  # [22, 3]
-
-        # 坐标转换
-        jp_unity = np.zeros_like(joint_pos)
-        jp_unity[:, 0] = joint_pos[:, 0]   # SMPL X → Unity X
-        jp_unity[:, 1] = joint_pos[:, 2]   # SMPL Z → Unity Y
-        jp_unity[:, 2] = -joint_pos[:, 1]  # -SMPL Y → Unity Z
-        jp_unity[:, 0] += 0.2              # X偏移
-        jp_unity[:, 1] -= 0.1              # Y偏移
-        return jp_unity  # (22, 3)
+        print("=" * 64)
+        print(f"AMASS -> EGO_UNITY bridge ({self.mode})")
+        print(f"WebSocket: ws://{self.host}:{self.port}/ws")
+        print(f"Frames: {self.sequence.length}")
+        print("=" * 64)
+        async with websockets.serve(
+            self.handle_connection,
+            self.host,
+            self.port,
+            max_size=1024 * 1024,
+            ping_interval=20,
+            ping_timeout=60,
+        ):
+            await asyncio.Future()
 
 
-if __name__ == '__main__':
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Play AMASS through EGO_UNITY")
+    parser.add_argument("--mode", choices=("raw", "model"), default="raw")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--data", default=DEFAULT_DATA)
+    parser.add_argument("--yaml", default=DEFAULT_YAML)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--window-size", type=int, default=80)
+    parser.add_argument("--max-frames", type=int, default=600)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        model = load_model(
+            yaml_path=args.yaml,
+            pretrained_path=args.checkpoint,
+            device=args.device,
+        )
+        sequence = load_amass_sequence(
+            data_path=args.data,
+            body_model=model.bm,
+            device=model.device,
+            max_frames=args.max_frames,
+        )
+        server = AmassPlaybackServer(
+            model=model,
+            sequence=sequence,
+            mode=args.mode,
+            host=args.host,
+            port=args.port,
+            window_size=args.window_size,
+        )
+        asyncio.run(server.run())
+    except KeyboardInterrupt:
+        print("\n[bridge] stopped")
+
+
+if __name__ == "__main__":
     main()
