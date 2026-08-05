@@ -82,6 +82,50 @@ The NPZ keeps frame-aligned tracker poses, SMPL-space poses, `sparse_input`
 `joints_unity` (`[N, 22, 3]`). Use `has_prediction` to exclude warm-up or
 failed inference frames.
 
+### Offline EGO_UNITY CSV inference
+
+`infer_unity_csv.py` converts every Unity CSV row to the same `trackers`
+message used by the live WebSocket path. It reuses the realtime coordinate
+conversion, 54D encoder, 80-frame runner, SMPL-H FK, and NPZ recorder.
+
+First validate the CSV and generate encoded 54D features without loading
+PyTorch, the checkpoint, or SMPL-H:
+
+```bash
+python infer_unity_csv.py /path/to/egoposer_tracking.csv \
+  --validate-only \
+  --output recordings/csv_features.npz
+```
+
+Run full offline inference:
+
+```bash
+python infer_unity_csv.py /path/to/egoposer_tracking.csv \
+  --device cuda \
+  --output recordings/csv_predictions.npz
+```
+
+The script rejects malformed rows, resets temporal state after non-positive or
+greater-than-0.5-second timestamp gaps, and skips a tracked head whose position
+is the all-zero startup sentinel. Missing wrists remain supported through the
+same FOV masking as live inference. Use `--allow-zero-head` only when the Unity
+world origin is intentionally a valid head position, and use
+`--start-sequence N` to ignore an earlier section of a recording.
+
+The output schema is identical to live recording. Select final body data with:
+
+```python
+import numpy as np
+
+data = np.load("recordings/csv_predictions.npz")
+valid = data["has_prediction"]
+sequence = data["sequence"][valid]
+joints = data["joints_unity"][valid]  # [valid_frames, 22, 3]
+```
+
+The first 79 consecutive encoded frames are warm-up frames. Full inference
+still requires `model_zoo/egoposer.pth` and the licensed SMPL-H/DMPL assets.
+
 Set Unity's `Application.persistentDataPath/EgoPoserConfig/server.json` to:
 
 ```json
